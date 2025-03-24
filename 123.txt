@@ -237,47 +237,58 @@ export default {
 };
 
 async function 特洛伊OverWSHandler(request) {
-	const webSocketPair = new WebSocketPair();
-	const [client, webSocket] = Object.values(webSocketPair);
-	webSocket.accept();
-      const webSocketPair = new WebSocketPair();
+    const webSocketPair = new WebSocketPair();
     const [client, webSocket] = Object.values(webSocketPair);
     webSocket.accept();
-    const pingInterval = 30000; // 30 秒
-    const pingTimer = setTimeout(() => {
-        if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            webSocket.send(new Uint8Array([0x9])); // 发送 ping 帧
+        const pingInterval = 15000; // 每 15 秒发送一次 ping
+    let lastPongTime = Date.now();
+
+    webSocket.addEventListener('message', (event) => {
+        if (event.data instanceof ArrayBuffer && new Uint8Array(event.data)[0] === 0xA) {
+            lastPongTime = Date.now(); // 更新最后收到 pong 的时间
         }
-        clearTimeout(pingTimer);
-        const intervalId = setInterval(() => {
-            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                webSocket.send(new Uint8Array([0x9]));
-            } else {
-                clearInterval(intervalId); // 连接关闭时停止 ping
+    });
+
+    const pingTimer = setInterval(() => {
+        const now = Date.now();
+        if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            if (now - lastPongTime > 60000) { // 60 秒未收到 pong，关闭连接
+                log("未收到 pong，关闭连接");
+                webSocket.close();
+                return;
             }
-        }, pingInterval);
+            webSocket.send(new Uint8Array([0x9])); // 发送 ping 帧
+        } else {
+            clearInterval(pingTimer); // 连接关闭时清理
+        }
     }, pingInterval);
     let address = "";
-	let address = "";
-	let portWithRandomLog = "";
-	const log = (info, event) => {
-		console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
-	};
+    let portWithRandomLog = "";
+    const log = (info, event) => {
+        console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
+    };
+    // ... 其余代码保持不变 ...
 	const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
 	const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
 	let remoteSocketWapper = {
 		value: null
 	};
 	let udpStreamWrite = null;
+        const bufferSize = 256 * 1024; // 256 KB 缓冲区
+        let buffer = new Uint8Array(0);
 	readableWebSocketStream.pipeTo(new WritableStream({
     async write(chunk, controller) {
         if (udpStreamWrite) {
             return udpStreamWrite(chunk);
         }
+        buffer = new Uint8Array([...buffer, ...chunk]); // 累积数据
         if (remoteSocketWapper.value) {
-            const writer = remoteSocketWapper.value.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock();
+            if (buffer.length >= bufferSize) { // 达到缓冲区大小时写入
+                const writer = remoteSocketWapper.value.writable.getWriter();
+                await writer.write(buffer.slice(0, bufferSize));
+                writer.releaseLock();
+                buffer = buffer.slice(bufferSize); // 移除已写入部分
+            }
             return;
         }
         const {
@@ -292,7 +303,6 @@ async function 特洛伊OverWSHandler(request) {
         portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
         if (hasError) {
             throw new Error(message);
-            return;
         }
         if (!banHosts.includes(addressRemote)) {
             log(`处理 TCP 出站连接 ${addressRemote}:${portRemote}`);
@@ -301,12 +311,19 @@ async function 特洛伊OverWSHandler(request) {
             throw new Error(`黑名单关闭 TCP 出站连接 ${addressRemote}:${portRemote}`);
         }
     },
-    close() {
+    async close() {
+        if (buffer.length > 0 && remoteSocketWapper.value) { // 关闭时写入剩余数据
+            const writer = remoteSocketWapper.value.writable.getWriter();
+            await writer.write(buffer);
+            writer.releaseLock();
+        }
         log(`readableWebSocketStream is closed`);
     },
     abort(reason) {
         log(`readableWebSocketStream is aborted`, JSON.stringify(reason));
     }
+}, {
+    highWaterMark: bufferSize // 设置流的高水位标记为 256 KB
 })).catch((err) => {
     log("readableWebSocketStream pipeTo error", err);
 });
@@ -979,9 +996,19 @@ async function get特洛伊Config(password, hostName, sub, UA, RproxyIP, _url, f
 		}
 
 		if (!userAgent.includes(('CF-Workers-SUB').toLowerCase()) && !_url.searchParams.has('b64') && !_url.searchParams.has('base64')) {
-			if ((userAgent.includes('clash') && !userAgent.includes('nekobox')) || (_url.searchParams.has('clash'))) {
-                url = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true&buffer_size=128128`;
+			            if ((userAgent.includes('clash') && !userAgent.includes('nekobox')) || (_url.searchParams.has('clash'))) {
+                url = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=true&scv=true&fdn=false&sort=false&new_name=true&buffer_size=256000&fast_open=true`;
                 isBase64 = false;
+            } else if (userAgent.includes('sing-box') || userAgent.includes('singbox') || _url.searchParams.has('singbox') || _url.searchParams.has('sb')) {
+                url = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=true&scv=true&fdn=false&sort=false&new_name=true&buffer_size=256000&fast_open=true`;
+                isBase64 = false;
+            } else if (userAgent.includes('surge') || _url.searchParams.has('surge')) {
+                url = `${subProtocol}://${subConverter}/sub?target=surge&ver=4&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&xudp=false&udp=false&tfo=true&expand=true&scv=true&fdn=false&buffer_size=256000`;
+                isBase64 = false;
+            } else if (userAgent.includes('loon') || _url.searchParams.has('loon')) {
+                url = `${subProtocol}://${subConverter}/sub?target=loon&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=true&scv=true&fdn=false&sort=false&new_name=true&buffer_size=256000&fast_open=true`;
+                isBase64 = false;
+            }
             } else if (userAgent.includes('sing-box') || userAgent.includes('singbox') || _url.searchParams.has('singbox') || _url.searchParams.has('sb')) {
                 url = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true&buffer_size=128128`;
                 isBase64 = false;
