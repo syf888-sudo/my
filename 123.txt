@@ -36,6 +36,35 @@ let httpsPorts = ["2053", "2083", "2087", "2096", "8443"];
 let sha224Password;
 const regex = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[.*\]):?(\d+)?#?(.*)?$/;
 let proxyIPPool = [];
+// 第 32 行
+function parseAddress(address, defaultPort = '443') {
+    // 第 33 行
+    if (!address) return { host: '', port: defaultPort };
+    // 第 34 行
+    address = address.split('//')[1] || address; // 移除协议前缀
+    // 第 35 行
+    if (address.includes('@')) address = address.split('@')[1]; // 移除认证部分
+    // 第 36 行
+    let host = address, port = defaultPort;
+    // 第 37 行
+    if (address.includes(']:')) {
+        // 第 38 行
+        [host, port] = address.split(']:');
+    // 第 39 行
+    } else if (address.split(':').length === 2) {
+        // 第 40 行
+        [host, port] = address.split(':');
+    // 第 41 行
+    } else if (address.includes('.tp')) {
+        // 第 42 行
+        port = address.split('.tp')[1].split('.')[0] || port;
+        // 第 43 行
+        host = address.split('.tp')[0];
+    // 第 44 行
+    }
+    // 第 45 行
+    return { host, port };
+}
 let path = '/?ed=2560';
 let link = [];
 let banHosts = [atob('c3BlZWQuY2xvdWRmbGFyZS5jb20=')];
@@ -240,27 +269,20 @@ async function 特洛伊OverWSHandler(request) {
     const webSocketPair = new WebSocketPair();
     const [client, webSocket] = Object.values(webSocketPair);
     webSocket.accept();
-        const pingInterval = 15000; // 每 15 秒发送一次 ping
-    let lastPongTime = Date.now();
-
-    webSocket.addEventListener('message', (event) => {
-        if (event.data instanceof ArrayBuffer && new Uint8Array(event.data)[0] === 0xA) {
-            lastPongTime = Date.now(); // 更新最后收到 pong 的时间
-        }
-    });
-
-    const pingTimer = setInterval(() => {
-        const now = Date.now();
+    // 插入 ping 逻辑
+    const pingInterval = 30000; // 30 秒
+    const pingTimer = setTimeout(() => {
         if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            if (now - lastPongTime > 60000) { // 60 秒未收到 pong，关闭连接
-                log("未收到 pong，关闭连接");
-                webSocket.close();
-                return;
-            }
             webSocket.send(new Uint8Array([0x9])); // 发送 ping 帧
-        } else {
-            clearInterval(pingTimer); // 连接关闭时清理
         }
+        clearTimeout(pingTimer);
+        const intervalId = setInterval(() => {
+            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                webSocket.send(new Uint8Array([0x9]));
+            } else {
+                clearInterval(intervalId); // 连接关闭时停止 ping
+            }
+        }, pingInterval);
     }, pingInterval);
     let address = "";
     let portWithRandomLog = "";
@@ -274,21 +296,15 @@ async function 特洛伊OverWSHandler(request) {
 		value: null
 	};
 	let udpStreamWrite = null;
-        const bufferSize = 256 * 1024; // 256 KB 缓冲区
-        let buffer = new Uint8Array(0);
 	readableWebSocketStream.pipeTo(new WritableStream({
     async write(chunk, controller) {
         if (udpStreamWrite) {
             return udpStreamWrite(chunk);
         }
-        buffer = new Uint8Array([...buffer, ...chunk]); // 累积数据
         if (remoteSocketWapper.value) {
-            if (buffer.length >= bufferSize) { // 达到缓冲区大小时写入
-                const writer = remoteSocketWapper.value.writable.getWriter();
-                await writer.write(buffer.slice(0, bufferSize));
-                writer.releaseLock();
-                buffer = buffer.slice(bufferSize); // 移除已写入部分
-            }
+            const writer = remoteSocketWapper.value.writable.getWriter();
+            await writer.write(chunk);
+            writer.releaseLock();
             return;
         }
         const {
@@ -303,6 +319,7 @@ async function 特洛伊OverWSHandler(request) {
         portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
         if (hasError) {
             throw new Error(message);
+            return;
         }
         if (!banHosts.includes(addressRemote)) {
             log(`处理 TCP 出站连接 ${addressRemote}:${portRemote}`);
@@ -311,27 +328,25 @@ async function 特洛伊OverWSHandler(request) {
             throw new Error(`黑名单关闭 TCP 出站连接 ${addressRemote}:${portRemote}`);
         }
     },
-    async close() {
-        if (buffer.length > 0 && remoteSocketWapper.value) { // 关闭时写入剩余数据
-            const writer = remoteSocketWapper.value.writable.getWriter();
-            await writer.write(buffer);
-            writer.releaseLock();
-        }
+    close() {
         log(`readableWebSocketStream is closed`);
     },
     abort(reason) {
         log(`readableWebSocketStream is aborted`, JSON.stringify(reason));
     }
-}, {
-    highWaterMark: bufferSize // 设置流的高水位标记为 256 KB
 })).catch((err) => {
     log("readableWebSocketStream pipeTo error", err);
 });
 	return new Response(null, {
 		status: 101,
 		// @ts-ignore
-		webSocket: client
-	});
+		webSocket: client,
+		headers: {
+		  "Sec-WebSocket-Accept": request.headers.get("Sec-WebSocket-Key"),
+		  "Sec-WebSocket-Protocol": earlyDataHeader // 加上这个header
+		}
+	  });	
+	
 }
 
 async function parse特洛伊Header(buffer) {
@@ -440,44 +455,52 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
 			return regex.test(address);
 		});
 	}
-	async function connectAndWrite(address, port, socks = false) {
-		log(`connected to ${address}:${port}`);
-		//if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LmlwLjA5MDIyNy54eXo=')}`;
-		const tcpSocket = socks ? await socks5Connect(addressType, address, port, log)
-			: connect({
-				hostname: address,
-				port
-			});
-		remoteSocket.value = tcpSocket;
-		//log(`connected to ${address}:${port}`);
-		const writer = tcpSocket.writable.getWriter();
-		await writer.write(rawClientData);
-		writer.releaseLock();
-		return tcpSocket;
-	}
-	async function retry() {
-		if (enableSocks) {
-			tcpSocket = await connectAndWrite(addressRemote, portRemote, true);
-		} else {
-			if (!proxyIP || proxyIP == '') {
-				proxyIP = atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg==');
-			} else if (proxyIP.includes(']:')) {
-				portRemote = proxyIP.split(']:')[1] || portRemote;
-				proxyIP = proxyIP.split(']:')[0] || proxyIP;
-			} else if (proxyIP.split(':').length === 2) {
-				portRemote = proxyIP.split(':')[1] || portRemote;
-				proxyIP = proxyIP.split(':')[0] || proxyIP;
-			}
-			if (proxyIP.includes('.tp')) portRemote = proxyIP.split('.tp')[1].split('.')[0] || portRemote;
-			tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
+	async function connectAndWrite(address, port, socks = false, retries = 3) {
+		for (let i = 0; i < retries; i++) {
+		  try {
+			log(`Attempt ${i + 1} to connect to ${address}:${port}`);
+			const tcpSocket = socks ? await socks5Connect(addressType, address, port, log)
+			  : connect({ hostname: address, port });
+			remoteSocket.value = tcpSocket;
+			const writer = tcpSocket.writable.getWriter();
+			await writer.write(rawClientData);
+			writer.releaseLock();
+			return tcpSocket;
+		  } catch (e) {
+			if (i === retries - 1) throw e;
+			await new Promise(resolve => setTimeout(resolve, 500)); // 500ms后重试
+		  }
 		}
-		tcpSocket.closed.catch((error) => {
-			console.log("retry tcpSocket closed error", error);
-		}).finally(() => {
-			safeCloseWebSocket(webSocket);
-		});
-		remoteSocketToWS(tcpSocket, webSocket, null, log);
-	}
+	  }
+	  async function retry() {
+        if (enableSocks && socks5s.length > 1) {
+            socks5Address = socks5s[Math.floor(Math.random() * socks5s.length)];
+            parsedSocks5Address = socks5AddressParser(socks5Address);
+            log(`重试使用新 SOCKS5 代理: ${socks5Address}`);
+            tcpSocket = await connectAndWrite(addressRemote, portRemote, true);
+        } else if (!enableSocks && proxyIPs.length > 1) {
+            proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+            log(`重试使用新 ProxyIP: ${proxyIP}`);
+            if (proxyIP.includes(']:')) {
+                portRemote = proxyIP.split(']:')[1] || portRemote;
+                proxyIP = proxyIP.split(']:')[0] || proxyIP;
+            } else if (proxyIP.split(':').length === 2) {
+                portRemote = proxyIP.split(':')[1] || portRemote;
+                proxyIP = proxyIP.split(':')[0] || proxyIP;
+            }
+            if (proxyIP.includes('.tp')) portRemote = proxyIP.split('.tp')[1].split('.')[0] || portRemote;
+            tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
+        } else {
+            log(`无可用新代理，重试使用当前代理`);
+            tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
+        }
+        tcpSocket.closed.catch((error) => {
+            console.log("retry tcpSocket closed error", error);
+        }).finally(() => {
+            safeCloseWebSocket(webSocket);
+        });
+        remoteSocketToWS(tcpSocket, webSocket, null, log);
+    }
 	let useSocks = false;
 	if (go2Socks5s.length > 0 && enableSocks) useSocks = await useSocks5Pattern(addressRemote);
 	let tcpSocket = await connectAndWrite(addressRemote, portRemote, useSocks);
@@ -996,19 +1019,9 @@ async function get特洛伊Config(password, hostName, sub, UA, RproxyIP, _url, f
 		}
 
 		if (!userAgent.includes(('CF-Workers-SUB').toLowerCase()) && !_url.searchParams.has('b64') && !_url.searchParams.has('base64')) {
-			            if ((userAgent.includes('clash') && !userAgent.includes('nekobox')) || (_url.searchParams.has('clash'))) {
-                url = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=true&scv=true&fdn=false&sort=false&new_name=true&buffer_size=256000&fast_open=true`;
+			if ((userAgent.includes('clash') && !userAgent.includes('nekobox')) || (_url.searchParams.has('clash'))) {
+                url = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true&buffer_size=128128`;
                 isBase64 = false;
-            } else if (userAgent.includes('sing-box') || userAgent.includes('singbox') || _url.searchParams.has('singbox') || _url.searchParams.has('sb')) {
-                url = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=true&scv=true&fdn=false&sort=false&new_name=true&buffer_size=256000&fast_open=true`;
-                isBase64 = false;
-            } else if (userAgent.includes('surge') || _url.searchParams.has('surge')) {
-                url = `${subProtocol}://${subConverter}/sub?target=surge&ver=4&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&xudp=false&udp=false&tfo=true&expand=true&scv=true&fdn=false&buffer_size=256000`;
-                isBase64 = false;
-            } else if (userAgent.includes('loon') || _url.searchParams.has('loon')) {
-                url = `${subProtocol}://${subConverter}/sub?target=loon&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=true&scv=true&fdn=false&sort=false&new_name=true&buffer_size=256000&fast_open=true`;
-                isBase64 = false;
-            }
             } else if (userAgent.includes('sing-box') || userAgent.includes('singbox') || _url.searchParams.has('singbox') || _url.searchParams.has('sb')) {
                 url = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(url)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=${subEmoji}&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true&buffer_size=128128`;
                 isBase64 = false;
@@ -1342,7 +1355,7 @@ async function getAddressesapi(api) {
 
 	const timeout = setTimeout(() => {
 		controller.abort(); // 取消所有请求
-	}, 100); // 2秒后触发
+	}, 1000); // 2秒后触发
 
 	try {
 		// 使用Promise.allSettled等待所有API请求完成，无论成功或失败
